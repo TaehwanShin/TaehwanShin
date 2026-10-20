@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Hand-written sample in the shape RAP generates for ZUI_TRAVEL (OData V4), for tests only. -->
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="com.sap.gateway.srvd.zui_travel.v0001" Alias="SAP__self" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="TravelType">
+        <Key><PropertyRef Name="TravelUUID"/><PropertyRef Name="IsActiveEntity"/></Key>
+        <Property Name="TravelUUID" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="TravelID" Type="Edm.String" MaxLength="8"/>
+        <Property Name="AgencyID" Type="Edm.String" MaxLength="6"/>
+        <Property Name="CustomerID" Type="Edm.String" MaxLength="6"/>
+        <Property Name="BeginDate" Type="Edm.Date"/>
+        <Property Name="EndDate" Type="Edm.Date"/>
+        <Property Name="TotalPrice" Type="Edm.Decimal" Precision="16" Scale="3"/>
+        <Property Name="CurrencyCode" Type="Edm.String" MaxLength="5"/>
+        <Property Name="OverallStatus" Type="Edm.String" MaxLength="1"/>
+        <Property Name="LocalLastChangedAt" Type="Edm.DateTimeOffset" Precision="7"/>
+        <Property Name="IsActiveEntity" Type="Edm.Boolean" Nullable="false"/>
+        <Property Name="HasActiveEntity" Type="Edm.Boolean" Nullable="false"/>
+        <Property Name="HasDraftEntity" Type="Edm.Boolean" Nullable="false"/>
+        <NavigationProperty Name="_Booking" Type="Collection(SAP__self.BookingType)" Partner="_Travel"/>
+        <NavigationProperty Name="_Agency" Type="SAP__self.AgencyType"/>
+        <NavigationProperty Name="DraftAdministrativeData" Type="SAP__self.DraftAdministrativeDataType"/>
+        <NavigationProperty Name="SiblingEntity" Type="SAP__self.TravelType"/>
+      </EntityType>
+      <EntityType Name="BookingType">
+        <Key><PropertyRef Name="BookingUUID"/><PropertyRef Name="IsActiveEntity"/></Key>
+        <Property Name="BookingUUID" Type="Edm.Guid" Nullable="false"/>
+        <Property Name="TravelUUID" Type="Edm.Guid"/>
+        <Property Name="BookingID" Type="Edm.String" MaxLength="4"/>
+        <Property Name="FlightPrice" Type="Edm.Decimal" Precision="16" Scale="3"/>
+        <Property Name="CurrencyCode" Type="Edm.String" MaxLength="5"/>
+        <Property Name="IsActiveEntity" Type="Edm.Boolean" Nullable="false"/>
+        <NavigationProperty Name="_Travel" Type="SAP__self.TravelType" Partner="_Booking"/>
+      </EntityType>
+      <EntityType Name="AgencyType">
+        <Key><PropertyRef Name="AgencyID"/></Key>
+        <Property Name="AgencyID" Type="Edm.String" Nullable="false" MaxLength="6"/>
+        <Property Name="Name" Type="Edm.String" MaxLength="80"/>
+      </EntityType>
+      <ComplexType Name="DraftAdministrativeDataType"/>
+      <Action Name="acceptTravel" IsBound="true">
+        <Parameter Name="_it" Type="SAP__self.TravelType" Nullable="false"/>
+        <ReturnType Type="SAP__self.TravelType" Nullable="false"/>
+      </Action>
+      <Action Name="rejectTravel" IsBound="true">
+        <Parameter Name="_it" Type="SAP__self.TravelType" Nullable="false"/>
+        <ReturnType Type="SAP__self.TravelType" Nullable="false"/>
+      </Action>
+      <Action Name="deductDiscount" IsBound="true">
+        <Parameter Name="_it" Type="SAP__self.TravelType" Nullable="false"/>
+        <Parameter Name="discount_percent" Type="Edm.Byte" Nullable="false"/>
+        <ReturnType Type="SAP__self.TravelType" Nullable="false"/>
+      </Action>
+      <Action Name="massUpdate" IsBound="true">
+        <Parameter Name="_it" Type="Collection(SAP__self.TravelType)" Nullable="false"/>
+      </Action>
+      <Action Name="Edit" IsBound="true">
+        <Parameter Name="_it" Type="SAP__self.TravelType" Nullable="false"/>
+        <Parameter Name="PreserveChanges" Type="Edm.Boolean"/>
+        <ReturnType Type="SAP__self.TravelType" Nullable="false"/>
+      </Action>
+      <Action Name="Activate" IsBound="true">
+        <Parameter Name="_it" Type="SAP__self.TravelType" Nullable="false"/>
+        <ReturnType Type="SAP__self.TravelType" Nullable="false"/>
+      </Action>
+      <Action Name="draftPrepare" IsBound="true">
+        <Parameter Name="_it" Type="SAP__self.TravelType" Nullable="false"/>
+        <ReturnType Type="SAP__self.TravelType" Nullable="false"/>
+      </Action>
+      <EntityContainer Name="Container">
+        <EntitySet Name="Travel" EntityType="SAP__self.TravelType">
+          <NavigationPropertyBinding Path="_Booking" Target="Booking"/>
+        </EntitySet>
+        <EntitySet Name="Booking" EntityType="SAP__self.BookingType"/>
+        <EntitySet Name="Agency" EntityType="SAP__self.AgencyType"/>
+      </EntityContainer>
+      <Annotations Target="SAP__self.TravelType/TravelUUID">
+        <Annotation Term="SAP__core.Computed"/>
+      </Annotations>
+      <Annotations Target="SAP__self.TravelType/TravelID">
+        <Annotation Term="SAP__core.Computed"/>
+      </Annotations>
+      <Annotations Target="SAP__self.TravelType/TotalPrice">
+        <Annotation Term="SAP__core.Computed"/>
+      </Annotations>
+      <Annotations Target="SAP__self.TravelType/OverallStatus">
+        <Annotation Term="SAP__core.Computed"/>
+      </Annotations>
+      <Annotations Target="SAP__self.TravelType/LocalLastChangedAt">
+        <Annotation Term="SAP__core.Computed"/>
+      </Annotations>
+      <Annotations Target="SAP__self.TravelType/CurrencyCode">
+        <Annotation Term="SAP__core.Immutable"/>
+      </Annotations>
+      <Annotations Target="SAP__self.TravelType/AgencyID">
+        <Annotation Term="SAP__common.FieldControl" EnumMember="SAP__common.FieldControlType/Mandatory"/>
+      </Annotations>
+      <Annotations Target="SAP__self.TravelType/CustomerID">
+        <Annotation Term="SAP__common.FieldControl" EnumMember="SAP__common.FieldControlType/Mandatory"/>
+      </Annotations>
+      <Annotations Target="SAP__self.TravelType/BeginDate">
+        <Annotation Term="SAP__common.FieldControl" EnumMember="SAP__common.FieldControlType/Mandatory"/>
+      </Annotations>
+      <Annotations Target="SAP__self.TravelType/EndDate">
+        <Annotation Term="SAP__common.FieldControl" EnumMember="SAP__common.FieldControlType/Mandatory"/>
+      </Annotations>
+      <Annotations Target="SAP__self.BookingType/BookingUUID">
+        <Annotation Term="SAP__core.Computed"/>
+      </Annotations>
+      <Annotations Target="SAP__self.BookingType/TravelUUID">
+        <Annotation Term="SAP__core.Computed"/>
+      </Annotations>
+      <Annotations Target="SAP__self.BookingType/BookingID">
+        <Annotation Term="SAP__core.Computed"/>
+      </Annotations>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

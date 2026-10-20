@@ -2,11 +2,11 @@
 """Generate an Insomnia V4 export (collection) from an ABAP RAP service definition.
 
 Two steps, both optional to run separately:
-  1. parse   SRVD (+ optional CDS projection views and BDEFs) -> spec JSON
-  2. render  spec JSON -> Insomnia V4 export JSON
+  1. parse   SRVD (+ optional CDS, BDEF sources and the service's $metadata) -> spec JSON
+  2. render  spec JSON -> Insomnia V4 export JSON, checked by insomnia_check.py before it is written
 
 Typical use:
-  srvd2insomnia.py --srvd zui_travel.srvd.srvdsrv --src-dir src/ \
+  srvd2insomnia.py --srvd zui_travel.srvd.srvdsrv --src-dir src/ --metadata metadata.xml \
       --binding ZUI_TRAVEL_O4 --collection-name "Travel O4" --dump-spec spec.json -o insomnia.json
   # review / fix spec.json, then re-render from it:
   srvd2insomnia.py --spec spec.json -o insomnia.json
@@ -22,6 +22,10 @@ import re
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # sibling modules, also under python -I
+import edmx  # noqa: E402
+import insomnia_check  # noqa: E402
+import payload  # noqa: E402
 # ---------------------------------------------------------------------------
 # Parsing helpers
 # ---------------------------------------------------------------------------
@@ -108,6 +112,40 @@ def remove_nested_blocks(body):
     return "".join(out)
 
 
+def mask_parens(s):
+    """Same-length copy of s with everything inside (...) blanked, for top-level searches."""
+    out, depth = [], 0
+    for ch in s:
+        if ch == "(":
+            depth += 1
+            out.append(ch)
+        elif ch == ")":
+            depth -= 1
+            out.append(ch)
+        else:
+            out.append(" " if depth > 0 else ch)
+    return "".join(out)
+
+
+def split_top(s):
+    parts, cur, depth, quoted = [], [], 0, False
+    for ch in s:
+        if ch == "'":
+            quoted = not quoted
+        if not quoted:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            elif ch in ",;" and depth == 0:
+                parts.append("".join(cur))
+                cur = []
+                continue
+        cur.append(ch)
+    parts.append("".join(cur))
+    return [p.strip() for p in parts if p.strip()]
+
+
 def parse_srvd(src):
     clean = strip_annotations(strip_comments(src))
     m = re.search(r"define\s+service\s+(\w+)", clean, re.I)
@@ -124,39 +162,131 @@ def parse_srvd(src):
     return name, entities
 
 
-def guess_type(field):
-    f = field.lower()
-    if f.endswith("uuid") or f.endswith("guid") or f in ("uuid", "guid"):
+def abap_to_edm(abap_type):
+    """(edm, maxLength) for a built-in ABAP type; (None, None) for data elements we cannot resolve."""
+    t = abap_type.lower().replace(" ", "")
+    m = re.match(r"(?:abap\.)?(\w+)(?:\((\d+)(?:,\d+)?\))?$", t)
+    if not m:
+        return None, None
+    base, length = m.group(1), m.group(2)
+    if base in ("int1", "int2", "int4"):
+        return "Edm.Int32", None
+    if base == "int8":
+        return "Edm.Int64", None
+    if base in ("dec", "curr", "quan", "decfloat16", "decfloat34", "d16n", "d34n"):
+        return "Edm.Decimal", None
+    if base == "fltp":
+        return "Edm.Double", None
+    if base in ("dats", "datn"):
+        return "Edm.Date", None
+    if base in ("tims", "timn"):
+        return "Edm.TimeOfDay", None
+    if base in ("utclong", "timestamp", "timestampl", "tzntstmps", "tzntstmpl"):
+        return "Edm.DateTimeOffset", None
+    if base in ("boolean", "abap_boolean", "xsdboolean", "abap_bool"):
+        return "Edm.Boolean", None
+    if base in ("sysuuid_x16", "sysuuid_c32", "sysuuid_c36") or (base == "raw" and length == "16"):
+        return "Edm.Guid", None
+    if base in ("char", "string", "sstring", "numc", "lang", "cuky", "unit", "clnt", "accp"):
+        return "Edm.String", length
+    return None, None
+
+
+def to_v2_edm(edm):
+    return {"Edm.Date": "Edm.DateTime", "Edm.TimeOfDay": "Edm.Time"}.get(edm, edm)
+
+
+def key_kind(edm):
+    if edm == "Edm.Guid":
         return "guid"
+    if edm in payload.INT_TYPES or edm in ("Edm.Int64", "Edm.Decimal", "Edm.Double"):
+        return "number"
     return "string"
 
 
+ASSOC_DEF = re.compile(r"\b(?:composition|association)\s*(?:\[[^\]]*\])?\s*(?:of|to)\s+(?:parent\s+)?"
+                       r"([\w/]+)\s+as\s+(_\w+)", re.I)
+
+
+def parse_element(p):
+    m = re.match(r"(_\w+)\b(.*)$", p, re.S)
+    if m:
+        t = re.search(r"redirected\s+to\s+(?:composition\s+child\s+|parent\s+)?([\w/]+)", m.group(2), re.I)
+        return {"assoc": m.group(1), "target": t.group(1) if t else None}
+    key = False
+    while True:
+        km = re.match(r"(key|virtual|localized)\s+", p, re.I)
+        if not km:
+            break
+        key = key or km.group(1).lower() == "key"
+        p = p[km.end():]
+    masked = mask_parens(p)
+    edm = max_len = None
+    colon = masked.find(":")
+    if colon >= 0:
+        edm, max_len = abap_to_edm(p[colon + 1:].strip())
+        p, masked = p[:colon].strip(), masked[:colon].strip()
+    am = re.search(r"\bas\s+(\w+)\s*$", masked, re.I)
+    if am:
+        name = am.group(1)
+    elif re.fullmatch(r"[\w.$]+", p):
+        name = p.split(".")[-1]
+    else:
+        return None  # unnamed expression
+    typed = edm is not None
+    if not typed:
+        edm = "Edm.Guid" if re.search(r"(uuid|guid)$", name, re.I) else "Edm.String"
+    f = {"name": name, "edm": edm, "key": key, "typed": typed}
+    if max_len:
+        f["maxLength"] = max_len
+    return f
+
+
 def parse_cds(src):
-    """Best effort: key fields (alias names) and exposed associations."""
+    """Fields, keys and associations of a CDS view / projection / abstract entity (best effort)."""
     clean = strip_annotations(strip_comments(src))
     m = re.search(r"define\s+(?:root\s+)?(?:view\s+entity|view|custom\s+entity|abstract\s+entity|"
                   r"table\s+function|transient\s+view\s+entity)\s+([\w/]+)", clean, re.I)
     name = m.group(1) if m else None
     root = bool(re.search(r"define\s+root\s+", clean, re.I))
-    # select list: last {...} block of the definition
-    body = ""
-    if m:
-        body, _ = block_after(clean, m.end())
-    keys = []
-    for km in re.finditer(r"\bkey\s+([\w.]+)(?:\s+as\s+(\w+))?(?:\s*:\s*([\w.]+))?", body, re.I):
-        field = km.group(2) or km.group(1).split(".")[-1]
-        typ = guess_type(field)
-        if km.group(3) and re.search(r"sysuuid|uuid|raw16", km.group(3), re.I):
-            typ = "guid"
-        keys.append({"name": field, "type": typ})
-    assocs = []
-    for am in re.finditer(r"(?:^|,)\s*(_\w+)\s*(?=[,:]|$)", body, re.M):
-        if am.group(1) not in assocs:
-            assocs.append(am.group(1))
-    return {"name": name, "root": root, "keys": keys, "associations": assocs}
+    base = re.search(r"\bprojection\s+on\s+([\w/]+)", clean, re.I)
+    body = block_after(clean, m.end())[0] if m else ""
+    header = clean[:clean.find(body)] if body else clean
+    fields, assocs, targets = [], [], {}
+    for target, alias in ASSOC_DEF.findall(header):
+        targets[alias] = target
+    for part in split_top(body):
+        el = parse_element(part)
+        if not el:
+            continue
+        if "assoc" in el:
+            if el["assoc"] not in assocs:
+                assocs.append(el["assoc"])
+            if el["target"]:
+                targets[el["assoc"]] = el["target"]
+        else:
+            fields.append(el)
+    return {"name": name, "root": root, "base": base.group(1) if base else None, "fields": fields,
+            "associations": assocs, "associationTargets": targets}
 
 
-DRAFT_ACTIONS = {"edit", "activate", "discard", "resume", "prepare"}
+DRAFT_ACTIONS = {"edit", "activate", "discard", "resume", "prepare", "draftprepare"}
+
+
+def parse_field_control(flat):
+    fields = {}
+    for fm in re.finditer(r"(?:^|;)\s*field\s*\(([^)]*)\)\s*([^;]+);", flat, re.I | re.M):
+        mods = [re.sub(r"\s+", "", x.lower()) for x in fm.group(1).split(",")]
+        for n in re.split(r"\s*,\s*", fm.group(2).strip()):
+            fc = fields.setdefault(n.lower(), {})
+            for mod in mods:
+                if mod in ("readonly", "numbering:managed"):
+                    fc["readonly"] = True
+                elif mod == "readonly:update":
+                    fc["createOnly"] = True
+                elif mod in ("mandatory", "mandatory:create"):
+                    fc["mandatory"] = True
+    return fields
 
 
 def parse_bdef(src):
@@ -169,36 +299,23 @@ def parse_bdef(src):
     for bm in re.finditer(r"define\s+behavior\s+for\s+([\w/]+)(?:\s+alias\s+(\w+))?", clean, re.I):
         body, _ = block_after(clean, bm.end())
         flat = remove_nested_blocks(body)
-        beh = {
-            "alias": bm.group(2),
-            "draft": draft,
-            "projection": projection,
-            "create": bool(re.search(r"(^|;)\s*(use\s+)?(internal\s+)?create\b(?!\s*\()", flat, re.I | re.M))
-            and not re.search(r"(^|;)\s*internal\s+create\b", flat, re.I | re.M),
-            "update": bool(re.search(r"(^|;)\s*(use\s+)?update\b", flat, re.I | re.M))
-            and not re.search(r"(^|;)\s*internal\s+update\b", flat, re.I | re.M),
-            "delete": bool(re.search(r"(^|;)\s*(use\s+)?delete\b", flat, re.I | re.M))
-            and not re.search(r"(^|;)\s*internal\s+delete\b", flat, re.I | re.M),
-            "actions": [],
-            "createByAssociation": [],
-        }
-        # "create ( features : instance );" -> the negative lookahead above skips it; re-check
-        if re.search(r"(^|;)\s*(use\s+)?create\s*\(", flat, re.I | re.M):
-            beh["create"] = True
+
+        def op(name):
+            return (bool(re.search(r"(^|;)\s*(use\s+)?%s\b" % name, flat, re.I | re.M))
+                    and not re.search(r"(^|;)\s*internal\s+%s\b" % name, flat, re.I | re.M))
+
+        beh = {"alias": bm.group(2), "draft": draft, "projection": projection,
+               "create": op("create"), "update": op("update"), "delete": op("delete"),
+               "actions": [], "createByAssociation": [], "fields": parse_field_control(flat)}
         for am in re.finditer(r"(?:^|;)\s*(use\s+)?((?:static\s+|factory\s+|internal\s+|repeatable\s+)*)"
                               r"(action|function)\s*(?:\([^)]*\))?\s+(\w+)([^;]*);", flat, re.I | re.M):
             mods = am.group(2).lower()
             if "internal" in mods or am.group(4).lower() in DRAFT_ACTIONS:
                 continue
-            rest = am.group(5)
-            pm = re.search(r"\bparameter\s+([\w/$]+)", rest, re.I)
-            beh["actions"].append({
-                "name": am.group(4),
-                "kind": am.group(3).lower(),
-                "static": "static" in mods,
-                "factory": "factory" in mods,
-                "parameter": pm.group(1) if pm else None,
-            })
+            pm = re.search(r"\bparameter\s+([\w/$]+)", am.group(5), re.I)
+            beh["actions"].append({"name": am.group(4), "kind": am.group(3).lower(),
+                                   "static": "static" in mods, "factory": "factory" in mods,
+                                   "parameter": pm.group(1) if pm else None})
         for asm in re.finditer(r"(?:^|;|})\s*(use\s+)?association\s+(_\w+)\s*\{([^}]*)\}", body, re.I | re.M):
             if re.search(r"\bcreate\b", asm.group(3), re.I):
                 beh["createByAssociation"].append(asm.group(2))
@@ -249,16 +366,30 @@ def build_spec(args):
     for v in behaviors.values():
         for a in v["actions"]:
             a["parameter"] = a["parameter"] or action_params.get(a["name"].lower())
+
+    alias_of = {e["cds"].lower(): e["alias"] for e in entities}
     warnings = []
     for e in entities:
         info = cds_info.get(e["cds"].lower())
         beh = behaviors.get(e["cds"].lower())
-        e["keys"] = info["keys"] if info else []
+        base_beh = behaviors.get(info["base"].lower()) if info and info["base"] else None
+        if not beh and base_beh:
+            beh = base_beh
+            warnings.append("no projection BDEF for %s: using %s" % (e["cds"], info["base"]))
+        # field control lives in the interface BDEF; a projection BDEF may add to it
+        fc = {}
+        for b in (base_beh, behaviors.get(e["cds"].lower())):
+            for k, v in (b or {}).get("fields", {}).items():
+                fc.setdefault(k, {}).update(v)
+        e["fields"] = [dict(f, **fc.get(f["name"].lower(), {})) for f in (info["fields"] if info else [])]
+        e["keys"] = [{"name": f["name"], "type": key_kind(f["edm"])} for f in e["fields"] if f["key"]]
         e["associations"] = info["associations"] if info else []
+        e["associationTargets"] = {a: alias_of.get(t.lower(), t)
+                                   for a, t in (info["associationTargets"] if info else {}).items()}
         e["root"] = info["root"] if info else e is entities[0]
-        if not info:
-            warnings.append("no CDS source for %s: keys unknown, fill 'keys' in the spec" % e["cds"])
-        elif not e["keys"]:
+        if not info and not args.metadata:
+            warnings.append("no CDS source for %s: keys and fields unknown (pass --metadata)" % e["cds"])
+        elif info and not e["keys"]:
             warnings.append("no key fields found in %s" % e["cds"])
         if beh:
             e.update({k: beh[k] for k in ("draft", "create", "update", "delete", "actions",
@@ -266,8 +397,29 @@ def build_spec(args):
         else:
             e.update({"draft": False, "create": False, "update": False, "delete": False,
                       "actions": [], "createByAssociation": []})
-            if behaviors:
+            if behaviors and info:
                 warnings.append("no behavior definition for %s: treated as read-only" % e["cds"])
+        for a in e["actions"]:
+            struct = cds_info.get((a["parameter"] or "").lower())
+            if struct:
+                a["params"] = [{"name": f["name"], "edm": f["edm"], "maxLength": f.get("maxLength")}
+                               for f in struct["fields"]]
+            elif a["parameter"]:
+                warnings.append("action %s.%s: parameter %s source not found, body fields unknown "
+                                "(pass --metadata or the abstract entity source)"
+                                % (e["alias"], a["name"], a["parameter"]))
+    by_alias = {e["alias"]: e for e in entities}
+    for e in entities:
+        for f in e["fields"]:
+            # RAP UUID keys are almost always managed numbering; $metadata settles it when given
+            if f["key"] and f["edm"] == "Edm.Guid" and not any(f.get(k) for k in ("readonly", "createOnly", "mandatory")):
+                f["readonly"] = True
+        for assoc in e["createByAssociation"]:
+            child = by_alias.get(e["associationTargets"].get(assoc))
+            # the child's copy of the parent key is filled by the framework
+            for f in (child or {}).get("fields", []):
+                if f["name"] in {k["name"] for k in e["keys"]} and not f["key"]:
+                    f["readonly"] = True
     if not behaviors:
         warnings.append("no BDEF given: all entities treated as read-only (GET only)")
     binding = args.binding or srvd_name
@@ -280,9 +432,80 @@ def build_spec(args):
         "serviceVersion": args.service_version,
         "baseUrl": args.base_url,
         "sapClient": args.sap_client,
+        "previewUrl": args.preview_url,
         "entities": entities,
     }
     return spec, warnings
+
+
+def apply_metadata(spec, md, warnings):
+    """Overwrite guessed facts with the service's $metadata: types, keys, read-only fields, operations."""
+    if spec.get("odataVersion") and spec["odataVersion"] != md["version"]:
+        warnings.append("$metadata is OData %s but spec says %s: using %s"
+                        % (md["version"], spec["odataVersion"], md["version"]))
+    spec["odataVersion"] = md["version"]
+    v2 = md["version"] == "v2"
+    for e in spec["entities"]:
+        es = md["entitySets"].get(e["alias"])
+        if not es:
+            warnings.append("entity set %s not in $metadata" % e["alias"])
+            continue
+        by_name = {f["name"]: f for f in e.get("fields", [])}
+        fields = []
+        for pname, p in es["props"].items():
+            f = dict(by_name.get(pname, {"name": pname}))
+            f.update({"edm": p["edm"], "key": pname in es["keys"], "typed": True})
+            if p["maxLength"]:
+                f["maxLength"] = p["maxLength"]
+            if p["computed"] or not (p["creatable"] or p["updatable"]):
+                f["readonly"] = True
+            elif p["immutable"] or not p["updatable"]:
+                f["createOnly"] = True
+            if p["mandatory"]:
+                f["mandatory"] = True
+            fields.append(f)
+        e["fields"] = fields
+        e["keys"] = [{"name": k, "type": key_kind(es["props"][k]["edm"])}
+                     for k in es["keys"] if k != "IsActiveEntity"]
+        if "IsActiveEntity" in es["keys"]:
+            e["draft"] = True
+        navs = {n: t for n, t in es["navs"].items() if n not in payload.DRAFT_FIELDS}
+        e["associations"] = list(navs)
+        e["associationTargets"] = {n: t for n, t in navs.items() if t}
+        # RAP's V2 binding exposes association _X as navigation property to_X
+        e["createByAssociation"] = [a if a in navs else "to" + a if "to" + a in navs else a
+                                    for a in e.get("createByAssociation", [])]
+
+        ops = [o for o in md["operations"] if o["boundSet"] == e["alias"]]
+        known = {a["name"].lower() for a in e.get("actions", [])}
+        for o in ops:  # operations the BDEF sources did not show
+            short = o["name"].lower()
+            if v2 or short in known or short in DRAFT_ACTIONS:
+                continue
+            e.setdefault("actions", []).append({"name": o["name"], "kind": o["kind"], "static": o["collection"],
+                                                "factory": False, "parameter": None})
+        key_names = {k["name"] for k in e["keys"]} | {"IsActiveEntity"}
+        for a in e.get("actions", []):
+            match = [o for o in ops if o["name"] == a["name"]] or \
+                    [o for o in ops if o["name"].lower().endswith(a["name"].lower())]
+            if not match:
+                warnings.append("action %s.%s not in $metadata" % (e["alias"], a["name"]))
+                continue
+            o = match[0]
+            a["params"] = [{"name": p["name"], "edm": p["edm"], "maxLength": p["maxLength"]}
+                           for p in o["params"] if not (v2 and p["name"] in key_names)]
+            if v2:
+                a["v2Name"], a["v2Method"] = o["name"], o["httpMethod"]
+            else:
+                a["static"] = o["collection"]
+        if v2 and e.get("draft"):
+            draft = {}
+            for kind, stem in (("Edit", "edit"), ("Activate", "activat"), ("Prepare", "prepar")):
+                hit = [o["name"] for o in ops if stem in o["name"].lower()]
+                if hit:
+                    draft[kind] = hit[0]
+            e["v2Draft"] = draft
+    return spec
 
 
 # ---------------------------------------------------------------------------
@@ -301,6 +524,12 @@ def service_path(spec):
     seg = "srvd_a2x" if spec["bindingType"] == "api" else "srvd"
     return "/sap/opu/odata4/sap/%s/%s/sap/%s/%s" % (b, seg, spec["serviceDefinition"].lower(),
                                                     spec["serviceVersion"])
+
+
+def preview_template(url):
+    """Browser URL copied from ADT's preview -> host and client replaced by environment variables."""
+    url = re.sub(r"^https?://[^/?#]+", "{{ _.base_url }}", url.strip())
+    return re.sub(r"([?&]sap-client=)\d+", r"\g<1>{{ _.sap_client }}", url)
 
 
 def var(entity, key):
@@ -333,22 +562,14 @@ def key_query(spec, entity, active=True):
     return q
 
 
-def sample_body(entity):
-    body = {}
-    for k in entity["keys"]:
-        if k.get("type") != "guid":  # managed UUID keys are usually early-numbered by the framework
-            body[k["name"]] = "{{ _.%s }}" % var(entity, k)
-    body["<Field>"] = "<value>"
-    return json.dumps(body, indent=2)
-
-
 def render(spec):
     svc = spec["serviceDefinition"]
     v2 = spec["odataVersion"] == "v2"
     name = spec.get("collectionName") or spec["serviceBinding"]
-    root = "{{ _.base_url }}" + service_path(spec)
+    root = "{{ _.base_url }}{{ _.service_path }}"
     ns = "com.sap.gateway.srvd.%s.v%s" % (svc.lower(), spec["serviceVersion"])
     now = int(time.time() * 1000)
+    by_alias = {e["alias"]: e for e in spec["entities"]}
     wrk = stable_id("wrk", name)
     resources = [{
         "_id": wrk, "_type": "workspace", "parentId": None, "name": name,
@@ -362,9 +583,12 @@ def render(spec):
     # so every modifying request just sends {{ _.csrf_token }}
     env_data = {
         "base_url": spec.get("baseUrl") or "https://<host>:<port>",
+        "service_path": service_path(spec),
         "sap_client": spec.get("sapClient") or "100",
         "csrf_token": "{%% response 'header', '%s', 'b64::%s::46b', 'when-expired', 600 %%}" % (
             csrf_id, base64.b64encode(b"x-csrf-token").decode()),
+        "preview_url": preview_template(spec["previewUrl"]) if spec.get("previewUrl")
+        else "{{ _.base_url }}/<paste the ADT service binding preview URL>",
         "username": "",
         "password": "",
     }
@@ -389,12 +613,14 @@ def render(spec):
                           "metaSortKey": sort[0], "created": now, "modified": now})
         return fid
 
-    setting_fld = folder("Setting", "CSRF token and service metadata. Run 'Fetch CSRF token' first.")
+    setting_fld = folder("Setting", "CSRF token, service metadata and the Fiori Elements preview. "
+                                    "Run 'Fetch CSRF token' first.")
     get_fld = folder("Get", "Read requests")
     post_fld = folder("Post", "Modifying requests (POST/PATCH/DELETE), sent with {{ _.csrf_token }}")
 
     def request(rname, method, url, params=None, body=None, desc="", rid=None, extra_headers=None,
-                parent=None):
+                parent=None, sap_client=True):
+        """body: a dict/list (serialized here) or None. Never pass a JSON string built by hand."""
         if parent is None:
             parent = get_fld if method == "GET" else post_fld
         sort[0] += 1
@@ -409,13 +635,18 @@ def render(spec):
         headers += extra_headers
         if method in ("PATCH", "PUT", "DELETE"):
             headers.append({"name": "If-Match", "value": "*"})
-        p = [{"name": "sap-client", "value": "{{ _.sap_client }}"}]
+        p = [{"name": "sap-client", "value": "{{ _.sap_client }}"}] if sap_client else []
         for n, val in params or []:
             p.append({"name": n, "value": val})
+        req_id = rid or stable_id("req", name, parent, rname)
+        # Insomnia keys header/parameter rows by a unique id ("Render Failure: Invalid array length" without)
+        for kind, rows in (("h", headers), ("p", p)):
+            for i, row in enumerate(rows):
+                row.update({"id": stable_id("pair", req_id, kind, str(i)), "disabled": False})
         resources.append({
-            "_id": rid or stable_id("req", name, parent, rname), "_type": "request", "parentId": parent,
+            "_id": req_id, "_type": "request", "parentId": parent,
             "name": rname, "description": desc, "method": method, "url": url,
-            "body": {} if body is None else {"mimeType": "application/json", "text": body},
+            "body": {} if body is None else {"mimeType": "application/json", "text": payload.dumps(body)},
             "parameters": p, "headers": headers, "authentication": auth,
             "metaSortKey": sort[0], "isPrivate": False, "settingStoreCookies": True,
             "settingSendCookies": True, "settingDisableRenderRequestBody": False,
@@ -430,12 +661,20 @@ def render(spec):
             extra_headers=[{"name": "X-CSRF-Token", "value": "Fetch"}])
     request("$metadata", "GET", root + "/$metadata", parent=setting_fld,
             extra_headers=[{"name": "Accept", "value": "application/xml"}])
+    request("Fiori Elements Preview", "GET", "{{ _.preview_url }}", parent=setting_fld, sap_client=False,
+            extra_headers=[{"name": "Accept", "value": "text/html"}],
+            desc="The page ADT opens from the service binding (Preview). Open it in a browser; "
+                 "Insomnia only shows the HTML. Set preview_url in the environment if it is still a placeholder.")
+
+    def key_value(e):
+        return lambda f: "{{ _.%s }}" % var(e, f)
 
     for e in spec["entities"]:
         ent = e["alias"]
         coll = root + "/" + ent
         pred = key_predicate(spec, e, active=True)
         draft_pred = key_predicate(spec, e, active=False)
+        parent_keys = {k["name"] for k in e["keys"]}
         list_params = fmt + [("$top", "50")]
         list_params.append(("$inlinecount", "allpages") if v2 else ("$count", "true"))
         request("%s - List" % ent, "GET", coll, list_params, desc="CDS entity %s" % e["cds"])
@@ -444,55 +683,77 @@ def render(spec):
             for assoc in e.get("associations", []):
                 request("%s - %s" % (ent, assoc), "GET", coll + pred + "/" + assoc, fmt + [("$top", "50")])
         if e.get("create"):
-            request("%s - Create" % ent, "POST", coll, fmt, body=sample_body(e),
-                    desc="Creates a draft instance." if e.get("draft") else "")
+            request("%s - Create" % ent, "POST", coll, fmt,
+                    body=payload.body_dict(e, v2, key_value=key_value(e)),
+                    desc=("Creates a draft instance.\n" if e.get("draft") else "") + payload.field_guide(e))
         for assoc in e.get("createByAssociation", []):
+            child = by_alias.get(e.get("associationTargets", {}).get(assoc))
             target_pred = draft_pred if e.get("draft") else pred
+            if child:
+                body = payload.body_dict(child, v2, exclude=parent_keys, key_value=key_value(child))
+                desc = "Creates %s under %s.\n%s" % (child["alias"], ent,
+                                                    payload.field_guide(child, exclude=parent_keys))
+            else:
+                body, desc = {}, "Target entity of %s unknown: add the child's fields." % assoc
             request("%s - Create via %s" % (ent, assoc), "POST", coll + target_pred + "/" + assoc, fmt,
-                    body=json.dumps({"<Field>": "<value>"}, indent=2))
+                    body=body, desc=desc)
+        if e.get("create") and not v2:
+            deep = {a: by_alias.get(e.get("associationTargets", {}).get(a)) for a in e.get("createByAssociation", [])}
+            deep = {a: c for a, c in deep.items() if c}
+            if deep:
+                body = payload.body_dict(e, v2, key_value=key_value(e))
+                for a, c in deep.items():
+                    body[a] = [payload.body_dict(c, v2, exclude=parent_keys, key_value=key_value(c))]
+                request("%s - Create (deep)" % ent, "POST", coll, fmt, body=body,
+                        desc="Deep create: %s with %s in one request." % (ent, ", ".join(deep)))
         if e.get("update"):
             target_pred = draft_pred if e.get("draft") else pred
             request("%s - Update" % ent, "PATCH", coll + target_pred, fmt,
-                    body=json.dumps({"<Field>": "<value>"}, indent=2),
-                    desc="Draft enabled: edit the draft instance (IsActiveEntity=false), then Activate."
-                    if e.get("draft") else "")
+                    body=payload.body_dict(e, v2, for_update=True),
+                    desc=("Draft enabled: edit the draft instance (IsActiveEntity=false), then Activate.\n"
+                          if e.get("draft") else "") + payload.field_guide(e, for_update=True))
         if e.get("delete"):
             # draft children are only changed through the draft of their root
             child_draft = e.get("draft") and not e.get("root")
             request("%s - Delete" % ent, "DELETE", coll + (draft_pred if child_draft else pred), fmt)
         if e.get("draft") and e.get("root"):
-            for dname, active, body in (("Edit", True, '{\n  "PreserveChanges": true\n}'),
-                                        ("Activate", False, "{}"),
-                                        ("Prepare", False, "{}")):
-                p = pred if active else draft_pred
+            for dname, active, body in (("Edit", True, {"PreserveChanges": True}),
+                                        ("Activate", False, {}),
+                                        ("Prepare", False, {})):
                 if v2:
-                    request("%s - Draft %s" % (ent, dname), "POST", root + "/" + ent + dname,
+                    fi = e.get("v2Draft", {}).get(dname) or ent + dname
+                    request("%s - Draft %s" % (ent, dname), "POST", root + "/" + fi,
                             fmt + key_query(spec, e, active))
                 else:
                     op = "draftPrepare" if dname == "Prepare" else dname
-                    request("%s - Draft %s" % (ent, dname), "POST", coll + p + "/" + ns + "." + op, body=body)
+                    request("%s - Draft %s" % (ent, dname), "POST",
+                            coll + (pred if active else draft_pred) + "/" + ns + "." + op, body=body)
             request("%s - Discard draft" % ent, "DELETE", coll + draft_pred, fmt)
         for a in e.get("actions", []):
             label = "Function" if a["kind"] == "function" else "Action"
+            params = a.get("params")
+            desc = [k for k in ("static", "factory") if a.get(k)]
+            if params:
+                desc.append("Parameters:\n" + "\n".join("- %s (%s)" % (p["name"], p["edm"]) for p in params))
+            elif a.get("parameter"):
+                desc.append("parameter structure %s: fields unknown, pass --metadata" % a["parameter"])
             if v2:
-                params = fmt + ([] if a["static"] else key_query(spec, e, True))
-                method = "GET" if a["kind"] == "function" else "POST"
-                request("%s - %s %s" % (ent, label, a["name"]), method, root + "/" + a["name"], params,
-                        desc="V2 function import name may be prefixed; verify in $metadata.")
+                fi = a.get("v2Name") or a["name"]
+                q = fmt + ([] if a["static"] else key_query(spec, e, True))
+                q += [(p["name"], payload.v2_url_literal(p["edm"])) for p in params or []]
+                method = a.get("v2Method") or ("GET" if a["kind"] == "function" else "POST")
+                if not a.get("v2Name"):
+                    desc.append("V2 function import name not verified: pass --metadata.")
+                request("%s - %s %s" % (ent, label, a["name"]), method, root + "/" + fi, q,
+                        desc="\n".join(desc))
                 continue
             url = (coll if a["static"] else coll + pred) + "/" + ns + "." + a["name"]
-            desc = []
-            if a["static"]:
-                desc.append("static")
-            if a["factory"]:
-                desc.append("factory")
-            if a["parameter"]:
-                desc.append("parameter structure %s: fill the body with its fields" % a["parameter"])
             if a["kind"] == "function":
-                request("%s - %s %s" % (ent, label, a["name"]), "GET", url + "()", desc=", ".join(desc))
+                args = ",".join("%s=%s" % (p["name"], payload.v4_url_literal(p["edm"])) for p in params or [])
+                request("%s - %s %s" % (ent, label, a["name"]), "GET", url + "(%s)" % args, desc="\n".join(desc))
             else:
-                request("%s - %s %s" % (ent, label, a["name"]), "POST", url,
-                        body='{\n  "<param>": "<value>"\n}' if a["parameter"] else "{}", desc=", ".join(desc))
+                body = {p["name"]: payload.json_sample(p["edm"], v2) for p in params or []}
+                request("%s - %s %s" % (ent, label, a["name"]), "POST", url, body=body, desc="\n".join(desc))
 
     return {
         "_type": "export", "__export_format": 4,
@@ -503,7 +764,7 @@ def render(spec):
 
 OVERRIDES = [("binding", "serviceBinding"), ("odata", "odataVersion"), ("binding_type", "bindingType"),
              ("service_version", "serviceVersion"), ("base_url", "baseUrl"), ("sap_client", "sapClient"),
-             ("collection_name", "collectionName")]
+             ("collection_name", "collectionName"), ("preview_url", "previewUrl")]
 DEFAULTS = {"odataVersion": "v4", "bindingType": "ui", "serviceVersion": "0001"}
 
 
@@ -513,6 +774,8 @@ def main():
     ap.add_argument("--src-dir", help="directory with CDS (.ddls.asddls) / BDEF (.bdef.asbdef) sources")
     ap.add_argument("--cds", nargs="*", help="extra CDS source files")
     ap.add_argument("--bdef", nargs="*", help="extra BDEF source files")
+    ap.add_argument("--metadata", help="the service's $metadata (EDMX file): exact types, keys, read-only "
+                                       "fields and action parameters for the payloads")
     ap.add_argument("--collection-name", help="Insomnia collection name (default: binding name)")
     ap.add_argument("--binding", help="service binding name (default: SRVD name)")
     ap.add_argument("--odata", choices=["v2", "v4"], help="default v4")
@@ -520,6 +783,7 @@ def main():
     ap.add_argument("--service-version", help="default 0001")
     ap.add_argument("--base-url", help="e.g. https://my-s4.example.com:44300")
     ap.add_argument("--sap-client", help="SAP client, e.g. 100")
+    ap.add_argument("--preview-url", help="browser URL of the ADT service binding preview (copied once)")
     ap.add_argument("--spec", help="render from an existing spec JSON instead of parsing sources")
     ap.add_argument("--dump-spec", help="write the parsed spec JSON here")
     ap.add_argument("-o", "--output", help="Insomnia V4 export JSON output path")
@@ -535,25 +799,38 @@ def main():
     for opt, field in OVERRIDES:
         if getattr(args, opt) is not None:
             spec[field] = getattr(args, opt)
+    if args.metadata:
+        apply_metadata(spec, edmx.parse_metadata(args.metadata), warnings)
     for field, default in DEFAULTS.items():
         if not spec.get(field):
             spec[field] = default
+    if spec["odataVersion"] == "v2":
+        for e in spec["entities"]:
+            for f in e.get("fields", []) + [p for a in e.get("actions", []) for p in a.get("params") or []]:
+                f["edm"] = to_v2_edm(f["edm"])
 
     for w in warnings:
         print("warning: " + w, file=sys.stderr)
     if args.dump_spec:
         with open(args.dump_spec, "w", encoding="utf-8") as fh:
-            json.dump(spec, fh, indent=2)
+            json.dump(spec, fh, indent=2, ensure_ascii=False)
         print("spec written: %s" % os.path.abspath(args.dump_spec), file=sys.stderr)
     if args.output:
         export = render(spec)
+        errors = insomnia_check.check(export)
+        if errors:
+            for e in errors:
+                print("error: " + e, file=sys.stderr)
+            sys.exit("error: generated export failed the Insomnia format check, nothing written")
         with open(args.output, "w", encoding="utf-8") as fh:
-            json.dump(export, fh, indent=2)
-        n = sum(1 for r in export["resources"] if r["_type"] == "request")
-        print("insomnia export written: %s (%d requests)" % (os.path.abspath(args.output), n),
-              file=sys.stderr)
+            json.dump(export, fh, indent=2, ensure_ascii=False)
+        reqs = [r for r in export["resources"] if r["_type"] == "request"]
+        folders = {r["_id"]: r["name"] for r in export["resources"] if r["_type"] == "request_group"}
+        counts = ", ".join("%s %d" % (n, sum(1 for r in reqs if r["parentId"] == fid)) for fid, n in folders.items())
+        print("insomnia export written: %s (%d requests: %s; format check ok)"
+              % (os.path.abspath(args.output), len(reqs), counts), file=sys.stderr)
     if not args.output and not args.dump_spec:
-        json.dump(spec, sys.stdout, indent=2)
+        json.dump(spec, sys.stdout, indent=2, ensure_ascii=False)
 
 
 if __name__ == "__main__":

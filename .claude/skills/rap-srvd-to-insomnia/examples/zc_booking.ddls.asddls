@@ -6,5 +6,6 @@ define view entity ZC_Booking
       TravelUUID,
       BookingID,
       FlightPrice,
+      CurrencyCode,
       _Travel : redirected to parent ZC_Travel
 }
