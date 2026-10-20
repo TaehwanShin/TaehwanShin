@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "insomnia": {
+      "command": "npx",
+      "args": ["-y", "mcp-insomnia@0.8.2"]
+    }
+  }
+}
