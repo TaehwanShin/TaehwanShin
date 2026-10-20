@@ -7,7 +7,7 @@ Two steps, both optional to run separately:
 
 Typical use:
   srvd2insomnia.py --srvd zui_travel.srvd.srvdsrv --src-dir src/ \
-      --binding ZUI_TRAVEL_O4 --dump-spec spec.json -o insomnia.json
+      --binding ZUI_TRAVEL_O4 --collection-name "Travel O4" --dump-spec spec.json -o insomnia.json
   # review / fix spec.json, then re-render from it:
   srvd2insomnia.py --spec spec.json -o insomnia.json
 
@@ -273,6 +273,7 @@ def build_spec(args):
     binding = args.binding or srvd_name
     spec = {
         "serviceDefinition": srvd_name,
+        "collectionName": args.collection_name or binding,
         "serviceBinding": binding,
         "odataVersion": args.odata,
         "bindingType": args.binding_type,
@@ -344,19 +345,26 @@ def sample_body(entity):
 def render(spec):
     svc = spec["serviceDefinition"]
     v2 = spec["odataVersion"] == "v2"
-    root = "{{ _.baseUrl }}" + service_path(spec)
+    name = spec.get("collectionName") or spec["serviceBinding"]
+    root = "{{ _.base_url }}" + service_path(spec)
     ns = "com.sap.gateway.srvd.%s.v%s" % (svc.lower(), spec["serviceVersion"])
     now = int(time.time() * 1000)
-    wrk = stable_id("wrk", svc, spec["serviceBinding"])
+    wrk = stable_id("wrk", name)
     resources = [{
-        "_id": wrk, "_type": "workspace", "parentId": None,
-        "name": "%s (OData %s)" % (spec["serviceBinding"], spec["odataVersion"].upper()),
-        "description": "Generated from RAP service definition %s" % svc,
+        "_id": wrk, "_type": "workspace", "parentId": None, "name": name,
+        "description": "Generated from RAP service definition %s (binding %s, OData %s)"
+                       % (svc, spec["serviceBinding"], spec["odataVersion"].upper()),
         "scope": "collection", "created": now, "modified": now,
     }]
+
+    csrf_id = stable_id("req", name, "csrf")
+    # the token lives in an environment variable that reads the Fetch request's response header,
+    # so every modifying request just sends {{ _.csrf_token }}
     env_data = {
-        "baseUrl": spec.get("baseUrl") or "https://<host>:<port>",
+        "base_url": spec.get("baseUrl") or "https://<host>:<port>",
         "sap_client": spec.get("sapClient") or "100",
+        "csrf_token": "{%% response 'header', '%s', 'b64::%s::46b', 'when-expired', 600 %%}" % (
+            csrf_id, base64.b64encode(b"x-csrf-token").decode()),
         "username": "",
         "password": "",
     }
@@ -364,34 +372,38 @@ def render(spec):
         for k in e["keys"]:
             env_data[var(e, k)] = ""
     resources.append({
-        "_id": stable_id("env", svc, "base"), "_type": "environment", "parentId": wrk,
-        "name": "Base Environment", "data": env_data, "dataPropertyOrder": None,
+        "_id": stable_id("env", name, "base"), "_type": "environment", "parentId": wrk,
+        "name": "Base Environment", "data": env_data, "dataPropertyOrder": {"&": list(env_data)},
         "color": None, "isPrivate": False, "metaSortKey": now, "created": now, "modified": now,
     })
 
-    csrf_id = stable_id("req", svc, "csrf")
-    csrf_tag = "{%% response 'header', '%s', 'b64::%s::46b', 'when-expired', 600 %%}" % (
-        csrf_id, base64.b64encode(b"x-csrf-token").decode())
     auth = {"type": "basic", "useISO88591": False, "disabled": False,
             "username": "{{ _.username }}", "password": "{{ _.password }}"}
     sort = [0]
 
-    def folder(name, parent, desc=""):
-        fid = stable_id("fld", svc, parent, name)
+    def folder(fname, desc=""):
+        fid = stable_id("fld", name, fname)
         sort[0] += 1
-        resources.append({"_id": fid, "_type": "request_group", "parentId": parent, "name": name,
+        resources.append({"_id": fid, "_type": "request_group", "parentId": wrk, "name": fname,
                           "description": desc, "environment": {}, "environmentPropertyOrder": None,
                           "metaSortKey": sort[0], "created": now, "modified": now})
         return fid
 
-    def request(parent, name, method, url, params=None, body=None, desc="", rid=None, extra_headers=None):
+    setting_fld = folder("Setting", "CSRF token and service metadata. Run 'Fetch CSRF token' first.")
+    get_fld = folder("Get", "Read requests")
+    post_fld = folder("Post", "Modifying requests (POST/PATCH/DELETE), sent with {{ _.csrf_token }}")
+
+    def request(rname, method, url, params=None, body=None, desc="", rid=None, extra_headers=None,
+                parent=None):
+        if parent is None:
+            parent = get_fld if method == "GET" else post_fld
         sort[0] += 1
         extra_headers = extra_headers or []
         headers = []
         if not any(h["name"] == "Accept" for h in extra_headers):
             headers.append({"name": "Accept", "value": "application/json"})
         if method not in ("GET", "HEAD"):
-            headers.append({"name": "X-CSRF-Token", "value": csrf_tag})
+            headers.append({"name": "X-CSRF-Token", "value": "{{ _.csrf_token }}"})
         if body is not None:
             headers.append({"name": "Content-Type", "value": "application/json"})
         headers += extra_headers
@@ -401,8 +413,8 @@ def render(spec):
         for n, val in params or []:
             p.append({"name": n, "value": val})
         resources.append({
-            "_id": rid or stable_id("req", svc, parent, name), "_type": "request", "parentId": parent,
-            "name": name, "description": desc, "method": method, "url": url,
+            "_id": rid or stable_id("req", name, parent, rname), "_type": "request", "parentId": parent,
+            "name": rname, "description": desc, "method": method, "url": url,
             "body": {} if body is None else {"mimeType": "application/json", "text": body},
             "parameters": p, "headers": headers, "authentication": auth,
             "metaSortKey": sort[0], "isPrivate": False, "settingStoreCookies": True,
@@ -412,65 +424,60 @@ def render(spec):
         })
 
     fmt = [("$format", "json")] if v2 else []
-    svc_fld = folder("00 Service", wrk, "CSRF token, service document and metadata")
-    request(svc_fld, "Fetch CSRF token", "GET", root + "/", fmt, rid=csrf_id,
-            desc="Run once per session. Modifying requests read the token from this response "
-                 "(response tag, re-fetched after 10 min). Session cookies are kept in the workspace cookie jar.",
+    request("Fetch CSRF token", "GET", root + "/", fmt, rid=csrf_id, parent=setting_fld,
+            desc="Run once per session. The csrf_token environment variable reads the token from this "
+                 "response (re-fetched after 10 min). Session cookies are kept in the workspace cookie jar.",
             extra_headers=[{"name": "X-CSRF-Token", "value": "Fetch"}])
-    request(svc_fld, "$metadata", "GET", root + "/$metadata",
+    request("$metadata", "GET", root + "/$metadata", parent=setting_fld,
             extra_headers=[{"name": "Accept", "value": "application/xml"}])
 
-    for idx, e in enumerate(spec["entities"], 1):
-        coll = root + "/" + e["alias"]
+    for e in spec["entities"]:
+        ent = e["alias"]
+        coll = root + "/" + ent
         pred = key_predicate(spec, e, active=True)
         draft_pred = key_predicate(spec, e, active=False)
-        f = folder("%02d %s" % (idx, e["alias"]), wrk, "CDS entity %s" % e["cds"])
         list_params = fmt + [("$top", "50")]
-        if not v2:
-            list_params.append(("$count", "true"))
-        else:
-            list_params.append(("$inlinecount", "allpages"))
-        request(f, "List %s" % e["alias"], "GET", coll, list_params)
+        list_params.append(("$inlinecount", "allpages") if v2 else ("$count", "true"))
+        request("%s - List" % ent, "GET", coll, list_params, desc="CDS entity %s" % e["cds"])
         if e["keys"] or e.get("draft"):
-            request(f, "Read %s by key" % e["alias"], "GET", coll + pred, fmt)
+            request("%s - Read by key" % ent, "GET", coll + pred, fmt)
             for assoc in e.get("associations", []):
-                request(f, "Read %s/%s" % (e["alias"], assoc), "GET", coll + pred + "/" + assoc,
-                        fmt + [("$top", "50")])
+                request("%s - %s" % (ent, assoc), "GET", coll + pred + "/" + assoc, fmt + [("$top", "50")])
         if e.get("create"):
-            request(f, "Create %s" % e["alias"], "POST", coll, fmt, body=sample_body(e),
+            request("%s - Create" % ent, "POST", coll, fmt, body=sample_body(e),
                     desc="Creates a draft instance." if e.get("draft") else "")
         for assoc in e.get("createByAssociation", []):
             target_pred = draft_pred if e.get("draft") else pred
-            request(f, "Create via %s" % assoc, "POST", coll + target_pred + "/" + assoc, fmt,
+            request("%s - Create via %s" % (ent, assoc), "POST", coll + target_pred + "/" + assoc, fmt,
                     body=json.dumps({"<Field>": "<value>"}, indent=2))
         if e.get("update"):
             target_pred = draft_pred if e.get("draft") else pred
-            request(f, "Update %s" % e["alias"], "PATCH", coll + target_pred, fmt,
+            request("%s - Update" % ent, "PATCH", coll + target_pred, fmt,
                     body=json.dumps({"<Field>": "<value>"}, indent=2),
                     desc="Draft enabled: edit the draft instance (IsActiveEntity=false), then Activate."
                     if e.get("draft") else "")
         if e.get("delete"):
             # draft children are only changed through the draft of their root
             child_draft = e.get("draft") and not e.get("root")
-            request(f, "Delete %s" % e["alias"], "DELETE", coll + (draft_pred if child_draft else pred), fmt)
+            request("%s - Delete" % ent, "DELETE", coll + (draft_pred if child_draft else pred), fmt)
         if e.get("draft") and e.get("root"):
             for dname, active, body in (("Edit", True, '{\n  "PreserveChanges": true\n}'),
                                         ("Activate", False, "{}"),
                                         ("Prepare", False, "{}")):
                 p = pred if active else draft_pred
                 if v2:
-                    request(f, "Draft %s" % dname, "POST", root + "/" + e["alias"] + dname,
+                    request("%s - Draft %s" % (ent, dname), "POST", root + "/" + ent + dname,
                             fmt + key_query(spec, e, active))
                 else:
-                    name = "draftPrepare" if dname == "Prepare" else dname
-                    request(f, "Draft %s" % dname, "POST", coll + p + "/" + ns + "." + name, body=body)
-            request(f, "Discard draft", "DELETE", coll + draft_pred, fmt)
+                    op = "draftPrepare" if dname == "Prepare" else dname
+                    request("%s - Draft %s" % (ent, dname), "POST", coll + p + "/" + ns + "." + op, body=body)
+            request("%s - Discard draft" % ent, "DELETE", coll + draft_pred, fmt)
         for a in e.get("actions", []):
+            label = "Function" if a["kind"] == "function" else "Action"
             if v2:
                 params = fmt + ([] if a["static"] else key_query(spec, e, True))
                 method = "GET" if a["kind"] == "function" else "POST"
-                request(f, "%s %s" % ("Function" if a["kind"] == "function" else "Action", a["name"]),
-                        method, root + "/" + a["name"], params,
+                request("%s - %s %s" % (ent, label, a["name"]), method, root + "/" + a["name"], params,
                         desc="V2 function import name may be prefixed; verify in $metadata.")
                 continue
             url = (coll if a["static"] else coll + pred) + "/" + ns + "." + a["name"]
@@ -482,10 +489,10 @@ def render(spec):
             if a["parameter"]:
                 desc.append("parameter structure %s: fill the body with its fields" % a["parameter"])
             if a["kind"] == "function":
-                request(f, "Function %s" % a["name"], "GET", url + "()", desc=", ".join(desc))
+                request("%s - %s %s" % (ent, label, a["name"]), "GET", url + "()", desc=", ".join(desc))
             else:
-                request(f, "Action %s" % a["name"], "POST", url, body='{\n  "<param>": "<value>"\n}'
-                        if a["parameter"] else "{}", desc=", ".join(desc))
+                request("%s - %s %s" % (ent, label, a["name"]), "POST", url,
+                        body='{\n  "<param>": "<value>"\n}' if a["parameter"] else "{}", desc=", ".join(desc))
 
     return {
         "_type": "export", "__export_format": 4,
@@ -495,7 +502,8 @@ def render(spec):
 
 
 OVERRIDES = [("binding", "serviceBinding"), ("odata", "odataVersion"), ("binding_type", "bindingType"),
-             ("service_version", "serviceVersion"), ("base_url", "baseUrl"), ("sap_client", "sapClient")]
+             ("service_version", "serviceVersion"), ("base_url", "baseUrl"), ("sap_client", "sapClient"),
+             ("collection_name", "collectionName")]
 DEFAULTS = {"odataVersion": "v4", "bindingType": "ui", "serviceVersion": "0001"}
 
 
@@ -505,6 +513,7 @@ def main():
     ap.add_argument("--src-dir", help="directory with CDS (.ddls.asddls) / BDEF (.bdef.asbdef) sources")
     ap.add_argument("--cds", nargs="*", help="extra CDS source files")
     ap.add_argument("--bdef", nargs="*", help="extra BDEF source files")
+    ap.add_argument("--collection-name", help="Insomnia collection name (default: binding name)")
     ap.add_argument("--binding", help="service binding name (default: SRVD name)")
     ap.add_argument("--odata", choices=["v2", "v4"], help="default v4")
     ap.add_argument("--binding-type", choices=["ui", "api"], help="ui (srvd) or api (srvd_a2x); default ui")
