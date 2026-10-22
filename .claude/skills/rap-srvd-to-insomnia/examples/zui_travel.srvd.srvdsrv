@@ -1,0 +1,6 @@
+@EndUserText.label: 'Travel - UI service'
+define service ZUI_TRAVEL {
+  expose ZC_Travel  as Travel;
+  expose ZC_Booking as Booking;
+  expose /DMO/I_Agency as Agency; // value help
+}

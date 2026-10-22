@@ -1,0 +1,47 @@
+managed implementation in class zbp_i_travel unique;
+strict ( 2 );
+with draft;
+
+define behavior for ZI_Travel alias Travel
+persistent table ztravel
+draft table ztravel_d
+lock master total etag LastChangedAt
+authorization master ( instance )
+etag master LocalLastChangedAt
+{
+  create ( authorization : global );
+  update;
+  delete;
+  field ( numbering : managed, readonly ) TravelUUID;
+  field ( readonly ) TravelID, OverallStatus, TotalPrice, LocalLastChangedAt;
+  field ( mandatory ) AgencyID, CustomerID, BeginDate, EndDate;
+  field ( readonly : update ) CurrencyCode;
+  association _Booking { create; with draft; }
+
+  action ( features : instance ) acceptTravel result [1] $self;
+  action ( features : instance ) rejectTravel result [1] $self;
+  action deductDiscount parameter ZA_Discount result [1] $self;
+  internal action reCalcTotalPrice;
+  static action massUpdate;
+  determination setTravelNumber on save { create; }
+
+  draft action Edit;
+  draft action Activate optimized;
+  draft action Discard;
+  draft action Resume;
+  draft determine action Prepare;
+}
+
+define behavior for ZI_Booking alias Booking
+persistent table zbooking
+draft table zbooking_d
+lock dependent by _Travel
+authorization dependent by _Travel
+{
+  update;
+  delete;
+  field ( numbering : managed, readonly ) BookingUUID;
+  field ( readonly ) TravelUUID, BookingID;
+  field ( mandatory ) FlightPrice;
+  association _Travel { with draft; }
+}
