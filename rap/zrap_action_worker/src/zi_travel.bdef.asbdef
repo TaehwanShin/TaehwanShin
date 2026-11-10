@@ -1,11 +1,7 @@
 managed implementation in class zbp_i_travel unique;
 strict ( 2 );
 
-/*
-  Root BO. 모든 action 은 여기에 정의한다.
-  Web API 별로 노출할 action 은 projection BDEF(zc_travel_api_*.bdef) 에서 use action 으로 선택한다.
-  action 구현은 zbp_i_travel 의 handler 가 zcl_trv_action_factory 를 통해 worker 클래스에 위임한다.
-*/
+// Root BO. 모든 action 은 여기에 정의하고, Web API 별 노출은 projection BDEF 의 use action 으로 고른다.
 define behavior for ZI_Travel alias Travel
 persistent table ztravel
 lock master
@@ -20,11 +16,7 @@ etag master LocalLastChangedAt
   field ( readonly ) TravelID, OverallStatus, TotalPrice, LocalLastChangedAt;
   field ( mandatory ) AgencyID, CustomerID, BeginDate, EndDate;
 
-  // 상태 전이 action — 허용 여부는 zcl_trv_status_rules 가 단일 소스
-  action ( features : instance ) acceptTravel result [1] $self;
-  action ( features : instance ) rejectTravel result [1] $self;
-  action ( features : instance ) reopenTravel result [1] $self;
-
-  // 파라미터 action
+  action acceptTravel result [1] $self;
+  action rejectTravel result [1] $self;
   action deductDiscount parameter ZA_Discount result [1] $self;
 }
