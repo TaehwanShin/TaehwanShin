@@ -1,0 +1,10 @@
+projection;
+strict ( 2 );
+
+// 가격 API: 수정과 할인 action 만 노출.
+define behavior for ZC_Travel_Api_Pricing alias Travel
+use etag
+{
+  use update;
+  use action deductDiscount;
+}

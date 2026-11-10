@@ -1,0 +1,11 @@
+projection;
+strict ( 2 );
+
+// 승인 API: 상태 전이 action 만 노출. 생성/수정/삭제/할인은 이 API 에서 보이지 않는다.
+define behavior for ZC_Travel_Api_Approval alias Travel
+use etag
+{
+  use action acceptTravel;
+  use action rejectTravel;
+  use action reopenTravel;
+}
